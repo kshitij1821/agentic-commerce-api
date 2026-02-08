@@ -1,5 +1,11 @@
+pydantic
 fastapi
 uvicorn
 python-dotenv
 openai
-pydantic
+google-search-results
+pgeocode
+python-dateutil
+requests
+beautifulsoup4
+forex-python
