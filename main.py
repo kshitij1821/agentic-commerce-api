@@ -351,18 +351,23 @@ class SmartShoppingAgent:
 # ==========================================
 
 # --- Models ---
+class ItemRequest(BaseModel):
+    query: str
+    preferences: Optional[str] = None
+
 class ChatRequest(BaseModel):
     session_id: str | None = None
-    message: str
+    delivery_pincode: str = "400076"
+    delivery_deadline_date: Optional[str] = None
+    total_budget: Optional[float] = None
+    budget_currency: str = "USD"
+    items: List[ItemRequest]
+    message: Optional[str] = None
 
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
     json_output: dict | None = None
-
-class ItemRequest(BaseModel):
-    query: str
-    preferences: Optional[str] = None
 
 class ShoppingRequest(BaseModel):
     delivery_pincode: str
@@ -390,16 +395,17 @@ Guardrails:
 •⁠  ⁠Do not engage in chit-chat.
 
 Defaults:
-•⁠  ⁠If delivery deadline is not specified even after being asked, assume 14 days from today.
-•⁠  ⁠If item preferences are not specified even after begin asked, "No specific preferences". 
+•⁠  ⁠If delivery deadline is not specified, assume 14 days from today.
+•⁠  ⁠If item preferences are not specified, use "No specific preferences".
+•⁠  ⁠Delivery pincode defaults to 400076.
+•⁠  ⁠Currency defaults to USD.
 
 Conversation Flow:
-1.⁠ ⁠Understand items user wants.
-2.⁠ ⁠Collect constraints and preferences.
-3.⁠ ⁠Ask for delivery pincode and deadline.
-4.⁠ ⁠Summarize order.
-5.⁠ ⁠Ask for confirmation.
-6.⁠ ⁠Only after confirmation output FINAL_JSON.
+1.⁠ ⁠Review the provided items, budget, and delivery details.
+2.⁠ ⁠Ask clarifying questions if needed (e.g., additional preferences).
+3.⁠ ⁠Summarize the order.
+4.⁠ ⁠Ask for confirmation.
+5.⁠ ⁠After confirmation, output FINAL_JSON with the provided data.
 
 When user confirms, respond:
 
@@ -411,10 +417,11 @@ JSON format:
 {
   "delivery_pincode": "...",
   "delivery_deadline_date": "...",
+  "total_budget": number,
+  "budget_currency": "...",
   "items": [
     {
       "query": "...",
-      "max_price": number,
       "preferences": "..."
     }
   ]
@@ -424,6 +431,8 @@ Rules:
 •⁠  ⁠NEVER output FINAL_JSON before confirmation.
 •⁠  ⁠Keep answers short.
 •⁠  ⁠Stay within shopping assistance.
+•⁠  ⁠Use the provided delivery_pincode, deadline, budget, and items.
+•⁠  ⁠If deadline is not provided in request, set it to 14 days from today (today is 2026-02-08).
 """
 
 def get_session(session_id):
@@ -435,7 +444,18 @@ def get_session(session_id):
 @app.post("/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest):
     session_id, session = get_session(req.session_id)
-    session["messages"].append({"role": "user", "content": req.message})
+    
+    # Format the structured request into a user message
+    items_str = "; ".join([f"{item.query} (Preferences: {item.preferences or 'None'})" for item in req.items])
+    deadline = req.delivery_deadline_date or (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+    user_message = f"""I want to order the following items:
+- Items: {items_str}
+- Delivery Pincode: {req.delivery_pincode}
+- Delivery Deadline: {deadline}
+- Total Budget: {req.total_budget or 'Not specified'} {req.budget_currency}
+{f"Additional notes: {req.message}" if req.message else ""}"""
+    
+    session["messages"].append({"role": "user", "content": user_message})
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + session["messages"]
 
@@ -456,8 +476,17 @@ def chat_endpoint(req: ChatRequest):
             # Clean up potential markdown code blocks
             if json_part.startswith("```json"):
                 json_part = json_part.replace("```json", "").replace("```", "")
-            json_output = json.loads(json_part)
-            assistant_reply = "I've generated your shopping plan! searching for the best deals now..."
+            parsed = json.loads(json_part)
+            
+            # Ensure the output has the correct structure with provided data
+            json_output = {
+                "delivery_pincode": parsed.get("delivery_pincode", req.delivery_pincode),
+                "delivery_deadline_date": parsed.get("delivery_deadline_date", deadline),
+                "total_budget": parsed.get("total_budget", req.total_budget),
+                "budget_currency": parsed.get("budget_currency", req.budget_currency),
+                "items": parsed.get("items", [item.dict() for item in req.items])
+            }
+            assistant_reply = "I've generated your shopping plan! Searching for the best deals now..."
         except:
             pass
 
