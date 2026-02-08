@@ -401,11 +401,11 @@ Defaults:
 •⁠  ⁠Currency defaults to USD.
 
 Conversation Flow:
-1.⁠ ⁠Review the provided items, budget, and delivery details.
-2.⁠ ⁠Ask clarifying questions if needed (e.g., additional preferences).
-3.⁠ ⁠Summarize the order.
+1.⁠ ⁠Understand items user wants and preferences.
+2.⁠ ⁠Collect constraints and preferences.
+3.⁠ ⁠Summarize order.
 4.⁠ ⁠Ask for confirmation.
-5.⁠ ⁠After confirmation, output FINAL_JSON with the provided data.
+5.⁠ ⁠Only after confirmation output FINAL_JSON.
 
 When user confirms, respond:
 
@@ -432,7 +432,6 @@ Rules:
 •⁠  ⁠Keep answers short.
 •⁠  ⁠Stay within shopping assistance.
 •⁠  ⁠Use the provided delivery_pincode, deadline, budget, and items.
-•⁠  ⁠If deadline is not provided in request, set it to 14 days from today (today is 2026-02-08).
 """
 
 def get_session(session_id):
