@@ -260,9 +260,9 @@ class SmartShoppingAgent:
         pincode = data.get("delivery_pincode", "10001")
         deadline = data.get("delivery_deadline_date")
         total_budget = data.get("total_budget")
-        budget_curr = data.get("budget_currency", "USD")
-        
-        location, budget_curr, gl = get_location_from_pincode(pincode)
+        location, loc_currency, gl = get_location_from_pincode(pincode)
+        # Use currency from profile (request); fallback to pincode-derived currency
+        budget_curr = (data.get("budget_currency") or loc_currency or "USD").strip().upper()
         items = data["items"]
         num_items = len(items)
         
@@ -395,19 +395,18 @@ Guardrails:
 •⁠  ⁠Do not engage in chit-chat.
 
 Defaults:
-•⁠  ⁠If delivery deadline is not specified even after being asked, assume 14 days from today.
+•⁠  ⁠Ask for delivery deadline at most ONCE. If the user does not specify a date, use 14 days from today and do not ask again.
 •⁠  ⁠If item preferences are not specified even after being asked, use "No specific preferences".
 •⁠  ⁠Delivery pincode defaults to 400076.
-•⁠  If the currency is not specified, assume USD.
+•⁠  Use the currency provided in the request (from user profile); do not ask for or override it.
 
 Conversation Flow:
 1.⁠ ⁠Understand items user wants and preferences.
-2.⁠ ⁠Collect budget andconstraints and preferences.
-3. Ask for delivery deadline if not provided.
-4.⁠ ⁠Summarize order.
-5.⁠ ⁠Ask for confirmation before proceeding with shopping.
-6.⁠ ⁠Only after confirmation output FINAL_JSON.
-7. Once the user agrees, dont ask for confirmation again and directly output FINAL_JSON with the provided details.
+2.⁠ ⁠Collect budget and constraints and preferences.
+3. Ask for delivery deadline once only; if not provided, assume 14 days from today and move on.
+4.⁠ ⁠Summarize order once.
+5.⁠ ⁠Ask for confirmation exactly once before proceeding with shopping.
+6.⁠ ⁠When the user confirms (yes/ok/sure/confirm/proceed/go ahead/looks good), output FINAL_JSON immediately. Do not ask for confirmation again.
 
 When user confirms, respond:
 
@@ -433,7 +432,7 @@ Rules:
 •⁠  ⁠NEVER output FINAL_JSON before confirmation.
 •⁠  ⁠Keep answers short.
 •⁠  ⁠Stay within shopping assistance.
-•⁠  ⁠Use the provided , deadline, budget, and items.
+•⁠  ⁠Use the provided pincode, deadline, budget, currency, and items from the user's message.
 """
 
 def get_session(session_id):
@@ -442,26 +441,67 @@ def get_session(session_id):
         sessions[session_id] = {"messages": []}
     return session_id, sessions[session_id]
 
+
+# Phrases that mean the user is confirming the plan (do not ask for confirmation again)
+CONFIRMATION_PHRASES = (
+    "yes", "yeah", "yep", "ok", "okay", "confirm", "confirmed", "sure", "proceed",
+    "go ahead", "looks good", "perfect", "do it", "please do", "sounds good",
+    "correct", "that's right", "approved", "confirm it", "go for it",
+)
+
+
+def _is_confirmation(message: str) -> bool:
+    if not message or not message.strip():
+        return False
+    text = message.strip().lower()
+    if len(text) > 100:  # Long messages are likely not a simple confirmation
+        return False
+    words = set(re.split(r"\s+", text))
+    return bool(words & set(CONFIRMATION_PHRASES)) or text in CONFIRMATION_PHRASES
+
+
+def _build_json_output_from_request(req: ChatRequest, deadline: str) -> dict:
+    return {
+        "delivery_pincode": req.delivery_pincode or "400076",
+        "delivery_deadline_date": deadline,
+        "total_budget": req.total_budget,
+        "budget_currency": (req.budget_currency or "USD").strip().upper(),
+        "items": [{"query": i.query, "preferences": i.preferences or ""} for i in req.items],
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest):
     session_id, session = get_session(req.session_id)
-    
+
+    deadline = req.delivery_deadline_date or (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+    has_items = bool(req.items)
+    has_pincode = bool(req.delivery_pincode and req.delivery_pincode.strip())
+
+    # If user already confirmed and we have enough data, return FINAL_JSON immediately
+    # so we never ask for confirmation again
+    if has_items and has_pincode and req.message and _is_confirmation(req.message):
+        json_output = _build_json_output_from_request(req, deadline)
+        reply = "I've generated your shopping plan! Searching for the best deals now..."
+        session["messages"].append({"role": "user", "content": req.message})
+        session["messages"].append({"role": "assistant", "content": reply})
+        return ChatResponse(session_id=session_id, reply=reply, json_output=json_output)
+
     # Format the structured request into a user message
     items_str = "; ".join([f"{item.query} (Preferences: {item.preferences or 'None'})" for item in req.items])
-    deadline = req.delivery_deadline_date or (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
     user_message = f"""I want to order the following items:
 - Items: {items_str}
 - Delivery Pincode: {req.delivery_pincode}
 - Delivery Deadline: {deadline}
 - Total Budget: {req.total_budget or 'Not specified'} {req.budget_currency}
 {f"Additional notes: {req.message}" if req.message else ""}"""
-    
+
     session["messages"].append({"role": "user", "content": user_message})
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + session["messages"]
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini", # Cost effective model for chat
+        model="gpt-4o-mini",  # Cost effective model for chat
         messages=messages,
         temperature=0.4,
     )
@@ -469,32 +509,29 @@ def chat_endpoint(req: ChatRequest):
     assistant_reply = response.choices[0].message.content
     session["messages"].append({"role": "assistant", "content": assistant_reply})
 
-    # Detect final JSON
+    # Detect final JSON from LLM
     json_output = None
     if "FINAL_JSON:" in assistant_reply:
         try:
             json_part = assistant_reply.split("FINAL_JSON:")[1].strip()
-            # Clean up potential markdown code blocks
             if json_part.startswith("```json"):
                 json_part = json_part.replace("```json", "").replace("```", "")
             parsed = json.loads(json_part)
-            
-            # Ensure the output has the correct structure with provided data
             json_output = {
                 "delivery_pincode": parsed.get("delivery_pincode", req.delivery_pincode),
                 "delivery_deadline_date": parsed.get("delivery_deadline_date", deadline),
                 "total_budget": parsed.get("total_budget", req.total_budget),
-                "budget_currency": parsed.get("budget_currency", req.budget_currency),
-                "items": parsed.get("items", [item.dict() for item in req.items])
+                "budget_currency": (parsed.get("budget_currency") or req.budget_currency or "USD").strip().upper(),
+                "items": parsed.get("items", [{"query": i.query, "preferences": i.preferences or ""} for i in req.items]),
             }
             assistant_reply = "I've generated your shopping plan! Searching for the best deals now..."
-        except:
+        except Exception:
             pass
 
     return ChatResponse(
         session_id=session_id,
         reply=assistant_reply,
-        json_output=json_output
+        json_output=json_output,
     )
 
 
