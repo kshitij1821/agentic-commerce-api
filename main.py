@@ -1,18 +1,17 @@
 import os
-import re
-import json
 import uuid
-from typing import List, Optional, Dict, Any
+import json
+import re
 from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 from serpapi import GoogleSearch
 
-# --- Optional Imports with Safety Checks ---
+# Safe imports for optional dependencies
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -35,36 +34,103 @@ try:
 except ImportError:
     CurrencyRates = None
 
-# ==========================================
-# 0. CONFIGURATION
-# ==========================================
+# Load environment variables
 load_dotenv()
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+# Initialize API keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 
-if not SERPAPI_KEY or not OPENAI_API_KEY:
-    print("⚠️  WARNING: API Keys not found in .env file.")
+if not OPENAI_API_KEY:
+    print("⚠️ WARNING: OPENAI_API_KEY not found in .env file.")
+if not SERPAPI_KEY:
+    print("⚠️ WARNING: SERPAPI_KEY not found in .env file.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI()
 
-app = FastAPI(title="Agentic Commerce API")
+# ==========================================
+# DATA MODELS
+# ==========================================
 
-# Allow CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
 
-# Global Session Storage for Chat
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+    json_output: dict | None = None
+
+# ==========================================
+# SESSION MANAGEMENT
+# ==========================================
+
 sessions: Dict[str, Dict[str, Any]] = {}
 
 # ==========================================
-# 1. HELPER FUNCTIONS (Shopping Logic)
+# SYSTEM PROMPT
 # ==========================================
+
+SYSTEM_PROMPT = """
+You are an AI shopping assistant.
+
+Your ONLY goal is to help users plan purchases.
+
+Guardrails:
+- Refuse unrelated requests politely.
+- Keep responses concise (1–2 sentences).
+- Ask only one question at a time.
+- Guide users toward purchase planning.
+- Do not engage in chit-chat.
+
+Conversation Flow:
+1. Understand items user wants.
+2. Collect budget constraints and ask for preferences.
+3. Ask for delivery place and deadline.
+4. Summarize order.
+5. Ask for confirmation.
+6. Only after confirmation output FINAL_JSON.
+
+Defaults:
+- If delivery deadline is not specified even after being asked, assume 14 days from today.
+- If item preferences are not specified even after being asked, "No specific preferences". 
+
+
+If the user asks for general categories, you MUST break it down into specific searchable cattegories.
+Example - "electronics"-> "laptop", "mouse", "keyboard"
+
+
+
+When user confirms, respond:
+
+FINAL_JSON:
+<json>
+
+JSON format:
+{
+  "delivery_pincode": "...",
+  "delivery_deadline_date": "...",
+  "total_budget" : number,
+  "items": [
+    {
+      "query": "...",
+      "preferences": "..."
+    }
+  ]
+}
+
+Rules:
+- NEVER output FINAL_JSON before confirmation.
+- Keep answers short.
+- Stay within shopping assistance.
+- NEVER leave fields null; apply defaults if needed 
+"""
+
+# ==========================================
+# HELPER FUNCTIONS (Location, Currency, Date)
+# ==========================================
+
 def _get_nomi(country):
     if pgeocode:
         try:
@@ -92,6 +158,7 @@ def _simplify_location(place: str, state: str, country_code: str) -> str:
 def get_location_from_pincode(pincode: str) -> tuple[str, str, str]:
     """Maps pincode -> (Location String, Currency, Country Code)."""
     pincode = str(pincode).strip()
+    # Simple heuristic: 6 digits = India, 5 digits = US
     country = "in" if len(pincode) == 6 and pincode.isdigit() else "us"
     nomi = _get_nomi(country)
 
@@ -101,7 +168,10 @@ def get_location_from_pincode(pincode: str) -> tuple[str, str, str]:
             if result is not None:
                 place = getattr(result, "place_name", None)
                 state = getattr(result, "state_name", None)
+                
+                # Handle pandas series or dict-like objects
                 if hasattr(result, 'values'): 
+                    # pgeocode often returns a pandas object, safer to convert to string if needed
                     place = str(place) if place and str(place) != 'nan' else ""
                     state = str(state) if state and str(state) != 'nan' else ""
                 
@@ -109,18 +179,26 @@ def get_location_from_pincode(pincode: str) -> tuple[str, str, str]:
                     loc = _simplify_location(place, state, country)
                     currency = "INR" if country == "in" else "USD"
                     return (loc, currency, country)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Location lookup warning: {e}")
+
+    # Fallbacks
     return ("United States", "USD", "us") if country == "us" else ("India", "INR", "in")
 
 def convert_budget_to_local(amount: float, from_curr: str, to_curr: str) -> float:
-    if from_curr == to_curr: return amount
+    """Converts budget (e.g. $100 -> ₹8300)."""
+    if from_curr == to_curr:
+        return amount
+    
+    # Try Forex Python
     if CurrencyRates:
         try:
             c = CurrencyRates()
             return c.convert(from_curr, to_curr, amount)
-        except Exception: pass
+        except Exception:
+            pass
     
+    # Hardcoded Fallbacks
     rates = {"USD": 1.0, "INR": 84.0, "EUR": 0.92, "GBP": 0.79}
     try:
         usd_base = amount / rates.get(from_curr, 1.0)
@@ -128,13 +206,47 @@ def convert_budget_to_local(amount: float, from_curr: str, to_curr: str) -> floa
     except:
         return amount
 
+def parse_delivery_date(delivery_str: str, base_date: datetime):
+    """Parses 'Free delivery by Wed, Feb 14' into '2026-02-14'."""
+    if not delivery_str or "unknown" in str(delivery_str).lower():
+        return None
+    
+    s = str(delivery_str).lower()
+    
+    # Relative terms
+    if "tomorrow" in s:
+        return (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "today" in s:
+        return base_date.strftime("%Y-%m-%d")
+    
+    # Regex for dates
+    try:
+        # Match "Feb 14" or "Oct 22"
+        match = re.search(r"([a-z]{3})\s(\d{1,2})", s)
+        if match:
+            # Assume current year, handle rollover later if needed
+            dt = date_parser.parse(f"{match.group(1)} {match.group(2)} {base_date.year}")
+            # If date is in the past (e.g. Dec search for Jan), add year
+            if dt < base_date - timedelta(days=30):
+                dt = dt.replace(year=base_date.year + 1)
+            return dt.strftime("%Y-%m-%d")
+            
+        # Fallback to fuzzy parsing
+        if date_parser:
+            dt = date_parser.parse(s, fuzzy=True, default=base_date)
+            return dt.strftime("%Y-%m-%d")
+    except:
+        pass
+    return None
+
 # ==========================================
-# 2. SMART SHOPPING AGENT CLASS
+# SMART SHOPPING AGENT
 # ==========================================
+
 class SmartShoppingAgent:
     def __init__(self):
         self.serp_api_key = SERPAPI_KEY
-        self.client = client
+        self.client = OpenAI(api_key=OPENAI_API_KEY)
 
     def search_google_shopping(self, query, pincode):
         location, currency, gl = get_location_from_pincode(pincode)
@@ -220,6 +332,7 @@ class SmartShoppingAgent:
         prompt = f"""
         You are a shopping assistant with STRICT budget enforcement.
         GOAL: Select the best 3 options for "{query}" from DIFFERENT RETAILERS within budget.
+        make the reasoning comparative (e.g. "Best Pick: X because it has free delivery and lowest price. Runner-up: Y is slightly more expensive but has better ratings. Budget Pick: Z is the cheapest option but has longer delivery time.")
         
         **CRITICAL BUDGET CONSTRAINT:** {max_price} {currency} per item.
         **RETAILER DIVERSITY:** All 3 picks MUST be from DIFFERENT retailers. Available: {retailers_str}
@@ -262,12 +375,12 @@ class SmartShoppingAgent:
         total_budget = data.get("total_budget")
         budget_curr = data.get("budget_currency", "USD")
         
-        location, budget_curr, gl = get_location_from_pincode(pincode)
+        location, local_curr, gl = get_location_from_pincode(pincode)
         items = data["items"]
         num_items = len(items)
         
         if total_budget:
-            local_total = convert_budget_to_local(total_budget, budget_curr, budget_curr)
+            local_total = convert_budget_to_local(total_budget, budget_curr, local_curr)
         else:
             local_total = 100000.0 * num_items # Default high budget
 
@@ -311,7 +424,7 @@ class SmartShoppingAgent:
             # Decide
             constraints = {
                 "max_price": per_item_budget,
-                "currency": budget_curr,
+                "currency": local_curr,
                 "deadline": deadline,
                 "location": location,
                 "preferences": item.get("preferences")
@@ -336,7 +449,7 @@ class SmartShoppingAgent:
 
         summary = {
             "total_budget_local": local_total,
-            "currency": budget_curr,
+            "currency": local_curr,
             "estimated_total_cost": total_cost_estimate,
             "budget_compliant": total_cost_estimate <= local_total
         }
@@ -347,27 +460,21 @@ class SmartShoppingAgent:
         }
 
 # ==========================================
-# 3. ENDPOINT DEFINITIONS
+# FASTAPI ENDPOINTS
 # ==========================================
 
-# --- Models ---
+def get_session(session_id):
+    if not session_id or session_id not in sessions:
+        session_id = str(uuid.uuid4())
+        sessions[session_id] = {
+            "messages": []
+        }
+    return session_id, sessions[session_id]
+
+
 class ItemRequest(BaseModel):
     query: str
     preferences: Optional[str] = None
-
-class ChatRequest(BaseModel):
-    session_id: str | None = None
-    delivery_pincode: str = "400076"
-    delivery_deadline_date: Optional[str] = None
-    total_budget: Optional[float] = None
-    budget_currency: str = "USD"
-    items: List[ItemRequest]
-    message: Optional[str] = None
-
-class ChatResponse(BaseModel):
-    session_id: str
-    reply: str
-    json_output: dict | None = None
 
 class ShoppingRequest(BaseModel):
     delivery_pincode: str
@@ -379,126 +486,49 @@ class ShoppingRequest(BaseModel):
 class ShoppingResponse(BaseModel):
     raw_results: Dict[str, Any]
     final_results: Dict[str, Any]
-
-
-# --- Chat Logic (Planner) ---
-SYSTEM_PROMPT = """
-You are an AI shopping assistant.
-
-Your ONLY goal is to help users plan purchases.
-
-Guardrails:
-•⁠  ⁠Refuse unrelated requests politely.
-•⁠  ⁠Keep responses concise (1–2 sentences).
-•⁠  ⁠Ask only one question at a time.
-•⁠  ⁠Guide users toward purchase planning.
-•⁠  ⁠Do not engage in chit-chat.
-
-Defaults:
-•⁠  ⁠If delivery deadline is not specified even after being asked, assume 14 days from today.
-•⁠  ⁠If item preferences are not specified even after being asked, use "No specific preferences".
-•⁠  ⁠Delivery pincode defaults to 400076.
-•⁠  If the currency is not specified, assume USD.
-
-Conversation Flow:
-1.⁠ ⁠Understand items user wants and preferences.
-2.⁠ ⁠Collect budget andconstraints and preferences.
-3. Ask for delivery deadline if not provided.
-4.⁠ ⁠Summarize order.
-5.⁠ ⁠Ask for confirmation before proceeding with shopping.
-6.⁠ ⁠Only after confirmation output FINAL_JSON.
-7. Once the user agrees, dont ask for confirmation again and directly output FINAL_JSON with the provided details.
-
-When user confirms, respond:
-
-FINAL_JSON:
-<json>
-
-JSON format:
-
-{
-  "delivery_pincode": "...",
-  "delivery_deadline_date": "...",
-  "total_budget": number,
-  "budget_currency": "...",
-  "items": [
-    {
-      "query": "...",
-      "preferences": "..."
-    }
-  ]
-}
-
-Rules:
-•⁠  ⁠NEVER output FINAL_JSON before confirmation.
-•⁠  ⁠Keep answers short.
-•⁠  ⁠Stay within shopping assistance.
-•⁠  ⁠Use the provided , deadline, budget, and items.
-"""
-
-def get_session(session_id):
-    if not session_id or session_id not in sessions:
-        session_id = str(uuid.uuid4())
-        sessions[session_id] = {"messages": []}
-    return session_id, sessions[session_id]
-
 @app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(req: ChatRequest):
+def chat(req: ChatRequest):
+    """
+    Main chat endpoint that handles conversation with the shopping assistant.
+    """
     session_id, session = get_session(req.session_id)
-    
-    # Format the structured request into a user message
-    items_str = "; ".join([f"{item.query} (Preferences: {item.preferences or 'None'})" for item in req.items])
-    deadline = req.delivery_deadline_date or (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-    user_message = f"""I want to order the following items:
-- Items: {items_str}
-- Delivery Pincode: {req.delivery_pincode}
-- Delivery Deadline: {deadline}
-- Total Budget: {req.total_budget or 'Not specified'} {req.budget_currency}
-{f"Additional notes: {req.message}" if req.message else ""}"""
-    
-    session["messages"].append({"role": "user", "content": user_message})
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + session["messages"]
+    session["messages"].append(
+        {"role": "user", "content": req.message}
+    )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += session["messages"]
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini", # Cost effective model for chat
+        model="gpt-4.1-mini",
         messages=messages,
         temperature=0.4,
     )
 
     assistant_reply = response.choices[0].message.content
-    session["messages"].append({"role": "assistant", "content": assistant_reply})
+    session["messages"].append(
+        {"role": "assistant", "content": assistant_reply}
+    )
 
     # Detect final JSON
-    json_output = None
     if "FINAL_JSON:" in assistant_reply:
+        json_part = assistant_reply.split("FINAL_JSON:")[1].strip()
         try:
-            json_part = assistant_reply.split("FINAL_JSON:")[1].strip()
-            # Clean up potential markdown code blocks
-            if json_part.startswith("```json"):
-                json_part = json_part.replace("```json", "").replace("```", "")
             parsed = json.loads(json_part)
-            
-            # Ensure the output has the correct structure with provided data
-            json_output = {
-                "delivery_pincode": parsed.get("delivery_pincode", req.delivery_pincode),
-                "delivery_deadline_date": parsed.get("delivery_deadline_date", deadline),
-                "total_budget": parsed.get("total_budget", req.total_budget),
-                "budget_currency": parsed.get("budget_currency", req.budget_currency),
-                "items": parsed.get("items", [item.dict() for item in req.items])
-            }
-            assistant_reply = "I've generated your shopping plan! Searching for the best deals now..."
+            return ChatResponse(
+                session_id=session_id,
+                reply="Order specification completed.",
+                json_output=parsed,
+            )
         except:
             pass
 
     return ChatResponse(
         session_id=session_id,
         reply=assistant_reply,
-        json_output=json_output
     )
 
-
-# --- Shopping Logic (Executor) ---
 @app.post("/shop", response_model=ShoppingResponse)
 async def shop_endpoint(request: ShoppingRequest):
     """
@@ -513,10 +543,15 @@ async def shop_endpoint(request: ShoppingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-def home():
-    return {"status": "Agent is running 🚀", "endpoints": ["/chat", "/shop"]}
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
     import uvicorn
+    print("🚀 Starting Shopping Assistant API...")
+    print("📡 Endpoints available:")
+    print("   POST /chat - Chat with shopping assistant")
+    print("   POST /search - Search for products directly")
+    print("\n📝 To test, run: python test_client.py --mode interactive")
     uvicorn.run(app, host="0.0.0.0", port=8000)
