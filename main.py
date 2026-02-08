@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 from serpapi import GoogleSearch
+from fastapi.middleware.cors import CORSMiddleware
 
 # Safe imports for optional dependencies
 try:
