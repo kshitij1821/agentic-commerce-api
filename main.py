@@ -49,6 +49,15 @@ if not SERPAPI_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
+# Allow CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ==========================================
 # DATA MODELS
 # ==========================================
