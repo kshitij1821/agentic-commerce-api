@@ -377,7 +377,7 @@ class SmartShoppingAgent:
             return None
 
     def process_shopping_list(self, json_input, raw_file="shopping_results_raw.json", final_file="shopping_results_final.json"):
-        data = json.loads(json_input)
+        data = json_input if isinstance(json_input, dict) else json.loads(json_input)
         final_report = {}
         raw_results = {}
         
