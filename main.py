@@ -262,12 +262,12 @@ class SmartShoppingAgent:
         total_budget = data.get("total_budget")
         budget_curr = data.get("budget_currency", "USD")
         
-        location, local_curr, gl = get_location_from_pincode(pincode)
+        location, budget_curr, gl = get_location_from_pincode(pincode)
         items = data["items"]
         num_items = len(items)
         
         if total_budget:
-            local_total = convert_budget_to_local(total_budget, budget_curr, local_curr)
+            local_total = convert_budget_to_local(total_budget, budget_curr, budget_curr)
         else:
             local_total = 100000.0 * num_items # Default high budget
 
@@ -311,7 +311,7 @@ class SmartShoppingAgent:
             # Decide
             constraints = {
                 "max_price": per_item_budget,
-                "currency": local_curr,
+                "currency": budget_curr,
                 "deadline": deadline,
                 "location": location,
                 "preferences": item.get("preferences")
@@ -336,7 +336,7 @@ class SmartShoppingAgent:
 
         summary = {
             "total_budget_local": local_total,
-            "currency": local_curr,
+            "currency": budget_curr,
             "estimated_total_cost": total_cost_estimate,
             "budget_compliant": total_cost_estimate <= local_total
         }
@@ -395,8 +395,8 @@ Guardrails:
 •⁠  ⁠Do not engage in chit-chat.
 
 Defaults:
-•⁠  ⁠If delivery deadline is not specified, assume 14 days from today.
-•⁠  ⁠If item preferences are not specified, use "No specific preferences".
+•⁠  ⁠If delivery deadline is not specified even after being asked, assume 14 days from today.
+•⁠  ⁠If item preferences are not specified even after being asked, use "No specific preferences".
 •⁠  ⁠Delivery pincode defaults to 400076.
 •⁠  ⁠Currency defaults to USD.
 
