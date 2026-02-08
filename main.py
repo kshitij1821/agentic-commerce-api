@@ -366,62 +366,116 @@ class SmartShoppingAgent:
             print(f"❌ LLM Error: {e}")
             return None
 
-    def process_shopping_list(self, data: Dict[str, Any]):
+    def process_shopping_list(self, json_input, raw_file="shopping_results_raw.json", final_file="shopping_results_final.json"):
+        data = json.loads(json_input)
         final_report = {}
         raw_results = {}
         
+        # 1. Global Context
         pincode = data.get("delivery_pincode", "10001")
         deadline = data.get("delivery_deadline_date")
-        total_budget = data.get("total_budget")
-        budget_curr = data.get("budget_currency", "USD")
+        total_budget = data.get("total_budget") # e.g. 200 USD
+        budget_curr = data.get("budget_currency", "USD") # e.g. USD
         
         location, local_curr, gl = get_location_from_pincode(pincode)
+        
+        # Initial variables
         items = data["items"]
         num_items = len(items)
         
         if total_budget:
             local_total = convert_budget_to_local(total_budget, budget_curr, local_curr)
         else:
-            local_total = 100000.0 * num_items # Default high budget
+            local_total = 100000.0 * num_items
+            total_budget = "Unlimited"
 
-        # Budget Allocation Logic
+        print(f"\n{'='*60}")
+        print(f"📍 Location: {location} | Currency: {local_curr}")
+        print(f"💰 TOTAL BUDGET: {total_budget} {budget_curr} = {local_total:,.0f} {local_curr}")
+        print(f"{'='*60}\n")
+
+        # ========== PHASE 1: DISCOVERY - Quick scan to understand price ranges ==========
+        print("📊 PHASE 1: Scanning market prices for each item...")
         item_price_ranges = {}
+        
         for item in items:
             query = item["query"]
             all_candidates = self.search_google_shopping(query, pincode)
+            
             if all_candidates:
                 prices = [p['price_val'] for p in all_candidates if p['price_val'] > 0]
                 if prices:
-                    item_price_ranges[query] = {"avg": sum(prices) / len(prices)}
-
-        budget_allocation = {}
+                    min_price = min(prices)
+                    max_price = max(prices)
+                    avg_price = sum(prices) / len(prices)
+                    item_price_ranges[query] = {
+                        "min": min_price,
+                        "max": max_price,
+                        "avg": avg_price,
+                        "count": len(prices)
+                    }
+                    print(f"   {query}: ₹{min_price:,.0f} - ₹{max_price:,.0f} (avg: ₹{avg_price:,.0f})")
+                    
+        # ========== PHASE 2: Dynamic Budget Allocation ==========
+        print(f"\n📈 PHASE 2: Calculating optimal budget allocation...")
+        
         if item_price_ranges:
+            # Calculate allocation based on average prices
             total_avg = sum(r['avg'] for r in item_price_ranges.values())
-            for query, r in item_price_ranges.items():
-                budget_allocation[query] = local_total * (r['avg'] / total_avg)
+            budget_allocation = {}
+            
+            for query, price_range in item_price_ranges.items():
+                # Allocate proportionally based on average price
+                proportion = price_range['avg'] / total_avg
+                allocated = local_total * proportion
+                budget_allocation[query] = allocated
+                print(f"   {query}: ₹{allocated:,.0f} ({proportion*100:.1f}% of budget)")
         else:
-            for item in items:
-                budget_allocation[item["query"]] = local_total / num_items
+            # Fallback to equal allocation
+            per_item = local_total / num_items
+            budget_allocation = {item["query"]: per_item for item in items}
+            print(f"   Using equal allocation: ₹{per_item:,.0f} per item")
 
-        # Main Loop
+        print(f"\n{'='*60}")
+        print(f"📋 BUDGET ALLOCATION SUMMARY:")
+        for query, budget in budget_allocation.items():
+            print(f"   {query}: ₹{budget:,.0f}")
+        print(f"{'='*60}\n")
+
+        # ========== PHASE 3: Detailed Search & Ranking with Optimized Budgets ==========
+        print("🔍 PHASE 3: Detailed search with optimized budgets...\n")
+        
+        all_selections = {}
         total_cost_estimate = 0
-        for item in items:
+        
+        for idx, item in enumerate(items, 1):
             query = item["query"]
             per_item_budget = budget_allocation.get(query, local_total / num_items)
             
-            # Search & Enrich
+            print(f"[Item {idx}/{num_items}] 🛍️  {query}")
+            print(f"   Budget: ₹{per_item_budget:,.0f}")
+            
+            # A. Search (Get ALL results)
             all_candidates = self.search_google_shopping(query, pincode)
+            
+            # B. Extract unique retailers from ALL results
+            unique_retailers = list(set([p.get('source', 'Unknown') for p in all_candidates]))
+            num_unique_retailers = len(unique_retailers)
+            
+            # C. Enrich Top 5 for final ranking (but keep all in raw)
             enriched_candidates = []
             for prod in all_candidates[:5]:
                 enriched_candidates.append(self.enrich_product_link(prod))
             
-            # Store Raw
+            # D. Store ALL results in raw_results with metadata
             raw_results[query] = {
                 "all_products": all_candidates,
+                "unique_retailers": unique_retailers,
+                "total_retailers": num_unique_retailers,
                 "total_products": len(all_candidates)
             }
             
-            # Decide
+            # E. Rank (using enriched top 5)
             constraints = {
                 "max_price": per_item_budget,
                 "currency": local_curr,
@@ -429,35 +483,70 @@ class SmartShoppingAgent:
                 "location": location,
                 "preferences": item.get("preferences")
             }
+            
             decision = self.rank_and_decide(query, enriched_candidates, constraints)
             
-            # Track Cost
+            # F. Extract best pick price for budget tracking
             best_pick_price = 0
             if decision and 'best_pick' in decision:
                 try:
                     price_str = str(decision['best_pick'].get('price', '0'))
                     clean_price = re.sub(r'[^\d.]', '', price_str.replace(',', ''))
                     best_pick_price = float(clean_price) if clean_price else 0
-                except: pass
-            total_cost_estimate += best_pick_price
+                except:
+                    pass
             
+            total_cost_estimate += best_pick_price
+            all_selections[query] = decision
+            
+            # G. Add metadata to final results
             final_report[query] = {
                 "recommendations": decision,
+                "unique_retailers": unique_retailers,
+                "total_retailers": num_unique_retailers,
+                "total_products_searched": len(all_candidates),
                 "allocated_budget": per_item_budget,
-                "best_pick_price": best_pick_price
+                "best_pick_price": best_pick_price,
+                "budget_compliant": best_pick_price <= per_item_budget * 1.05,  # Allow 5% margin
+                "savings": per_item_budget - best_pick_price
             }
 
+        # 3. Add Summary & Total Budget Check
         summary = {
-            "total_budget_local": local_total,
-            "currency": local_curr,
-            "estimated_total_cost": total_cost_estimate,
-            "budget_compliant": total_cost_estimate <= local_total
+            "budget_summary": {
+                "total_budget_usd": total_budget if isinstance(total_budget, str) else total_budget,
+                "total_budget_local": local_total,
+                "currency": local_curr,
+                "num_items": num_items,
+                "allocation_method": "Dynamic (based on market prices)" if item_price_ranges else "Equal split",
+                "price_ranges": item_price_ranges,
+                "estimated_total_cost": total_cost_estimate,
+                "budget_remaining": local_total - total_cost_estimate,
+                "budget_compliant": total_cost_estimate <= local_total
+            }
         }
         
-        return {
-            "raw_results": raw_results,
-            "final_results": {**summary, "items": final_report}
-        }
+        print(f"\n{'='*60}")
+        print(f"💸 FINAL BUDGET COMPLIANCE CHECK:")
+        print(f"   Total Budget: {local_total:,.0f} {local_curr}")
+        print(f"   Estimated Cost (Best Picks): {total_cost_estimate:,.0f} {local_curr}")
+        print(f"   Remaining: {local_total - total_cost_estimate:,.0f} {local_curr}")
+        print(f"   ✓ COMPLIANT: {total_cost_estimate <= local_total}")
+        print(f"{'='*60}\n")
+
+        # 4. Save Both Files
+        with open(raw_file, "w", encoding="utf-8") as f:
+            json.dump(raw_results, f, indent=2, ensure_ascii=False)
+        print(f"✅ Raw results (all searches + metadata) saved to: {raw_file}")
+        
+        # Add summary to final results
+        final_report_with_summary = {**summary, **final_report}
+        
+        with open(final_file, "w", encoding="utf-8") as f:
+            json.dump(final_report_with_summary, f, indent=2, ensure_ascii=False)
+        print(f"✅ Final results (top 3 from different retailers) saved to: {final_file}")
+        
+        return final_report_with_summary
 
 # ==========================================
 # FASTAPI ENDPOINTS
