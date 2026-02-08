@@ -628,18 +628,22 @@ def chat(req: ChatRequest):
         reply=assistant_reply,
     )
 
-@app.post("/shop", response_model=ShoppingResponse)
+@app.post("/shop")
 async def shop_endpoint(request: ShoppingRequest):
     """
     Takes a structured shopping plan (likely from /chat), runs the Agent, 
     and returns both raw and final results.
     """
     try:
-        request_data = request.dict()
-        agent = SmartShoppingAgent()
-        result = agent.process_shopping_list(request_data)
-        return result
+            # .dict() is deprecated in Pydantic v2, use .model_dump()
+            request_data = request.model_dump() 
+            agent = SmartShoppingAgent()
+            result = agent.process_shopping_list(request_data)
+            return result
     except Exception as e:
+        print(f"Error: {e}")
+        # If an error happens here, FastAPI returns a 500. 
+        # Without proper CORS, the browser hides this error and shows "CORS Error" instead.
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
